@@ -9,36 +9,97 @@ Two-agent workflow:
 Both agents call the IBM watsonx.ai REST API with the IBM Granite 4 H Small
 model.  The Pathologist Agent sends the image as a base-64 encoded data URL
 alongside the prompt; the Extension Officer Agent sends plain text.
+
+Guardrails are applied at every stage of the pipeline:
+  • Input  → validate_input, validate_image_file, validate_api_key_format,
+             check_jailbreak, check_sql_injection
+  • Data   → protect_data (PII masking on image metadata)
+  • Tool   → validate_tool_call (before every watsonx API call)
+  • Oper.  → check_operational_limits (token budget, rate limit, iterations)
+  • Output → validate_output, check_ethical_compliance (per-agent response)
+  • Multi  → validate_agent_handoff, verify_cross_agent_output
+  • Human  → assess_human_review_need, record_human_decision (UI approval)
+  • Audit  → get_compliance_report (shown in sidebar expander)
 """
 
 import base64
 import io
 import json
+import os
 import textwrap
+import time
 from datetime import datetime
+from pathlib import Path
 
 import requests
 import streamlit as st
+from dotenv import load_dotenv
 from PIL import Image
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-WATSONX_ENDPOINT = "https://us-south.ml.cloud.ibm.com"
-PROJECT_ID = "5247ecfe-b435-4f50-93e9-2ed52faedf1d"
-MODEL_ID = "ibm/granite-4-h-small"          # Granite 4 H Small identifier on watsonx
-IAM_TOKEN_URL = "https://iam.cloud.ibm.com/identity/token"
-
-# Text generation endpoint (supports multimodal for Granite 4)
-GENERATE_URL = f"{WATSONX_ENDPOINT}/ml/v1/text/chat?version=2024-05-31"
+import guardrails as gr
+import evaluator as ev
+import dashboard as db
 
 # ---------------------------------------------------------------------------
-# IBM IAM Token Helper
+# Load environment variables from .env (silently if file absent)
+# ---------------------------------------------------------------------------
+_ENV_PATH = Path(__file__).parent / ".env"
+load_dotenv(dotenv_path=_ENV_PATH, override=True)
+
+# ---------------------------------------------------------------------------
+# Configuration – auto-detect active LLM provider from .env
+# Priority: Replicate → watsonx → Gemini  (first un-commented key wins)
+# ---------------------------------------------------------------------------
+_REPLICATE_API_KEY = os.getenv("REPLICATE_API_KEY", "").strip()
+_WATSONX_API_KEY   = os.getenv("WATSONX_API_KEY",   "").strip()
+_GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY",     "").strip()
+
+WATSONX_ENDPOINT = ""
+PROJECT_ID       = ""
+IAM_TOKEN_URL    = ""
+
+if _REPLICATE_API_KEY:
+    LLM_PROVIDER   = "replicate"
+    _ENV_API_KEY   = _REPLICATE_API_KEY
+    MODEL_ID       = os.getenv("REPLICATE_MODEL_ID", "ibm-granite/granite-3.3-8b-instruct")
+    # Replicate Predictions API v1
+    GENERATE_URL   = "https://api.replicate.com/v1/models/{model}/predictions"
+    PROVIDER_LABEL = f"Replicate · {MODEL_ID}"
+elif _WATSONX_API_KEY:
+    LLM_PROVIDER     = "watsonx"
+    _ENV_API_KEY     = _WATSONX_API_KEY
+    MODEL_ID         = os.getenv("WATSONX_MODEL_ID",  "ibm/granite-4-h-small")
+    WATSONX_ENDPOINT = os.getenv("WATSONX_URL", "https://us-south.ml.cloud.ibm.com").rstrip("/")
+    PROJECT_ID       = os.getenv("WATSONX_PROJECT_ID","5247ecfe-b435-4f50-93e9-2ed52faedf1d")
+    IAM_TOKEN_URL    = "https://iam.cloud.ibm.com/identity/token"
+    GENERATE_URL     = f"{WATSONX_ENDPOINT}/ml/v1/text/chat?version=2024-05-31"
+    PROVIDER_LABEL   = f"IBM watsonx.ai · {MODEL_ID}"
+else:
+    LLM_PROVIDER   = "gemini"
+    _ENV_API_KEY   = _GEMINI_API_KEY
+    MODEL_ID       = os.getenv("GEMINI_MODEL_ID", "gemini-2.5-flash")
+    GENERATE_URL   = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{MODEL_ID}:generateContent"
+    )
+    PROVIDER_LABEL = f"Google Gemini · {MODEL_ID}"
+
+
+# ---------------------------------------------------------------------------
+# IBM IAM Token Helper  (watsonx only)
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=3000, show_spinner=False)
 def get_iam_token(api_key: str) -> str:
     """Exchange an IBM Cloud API key for a short-lived IAM bearer token."""
+    tool_check = gr.validate_tool_call(
+        tool_name="iam_token",
+        method="POST",
+        endpoint=IAM_TOKEN_URL,
+    )
+    if not tool_check:
+        raise RuntimeError(f"[Guardrail] IAM token call blocked: {tool_check.reason}")
+
     resp = requests.post(
         IAM_TOKEN_URL,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -56,22 +117,94 @@ def get_iam_token(api_key: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Core API call
+# Core API call  (provider-agnostic)
 # ---------------------------------------------------------------------------
 
-def call_watsonx(
+def call_llm(
     api_key: str,
     messages: list,
     max_tokens: int = 1024,
     temperature: float = 0.3,
+    agent_name: str = "agent",
+    timer: "ev.AgentTimer | None" = None,
 ) -> str:
     """
-    Send a chat-completion request to watsonx.ai and return the assistant
-    response text.
+    Send a chat-completion request to the active LLM provider and return
+    the assistant response text.
+
+    Supports:
+      • IBM watsonx.ai  (WATSONX_API_KEY set in .env)
+      • Google Gemini   (GEMINI_API_KEY set in .env, watsonx commented out)
 
     `messages` follows the OpenAI-style format:
-        [{"role": "user", "content": "..." | [...]}, ...]
+        [{"role": "user"|"system", "content": "..."}, ...]
+
+    Guardrails:  Tool execution + Operational limits applied.
+    Evaluation:  Token counts written to timer.record when provided.
     """
+    # [GUARDRAIL – TOOL] Validate tool call
+    tool_name_map = {
+        "watsonx":   "watsonx_inference",
+        "gemini":    "gemini_inference",
+        "replicate": "replicate_inference",
+    }
+    tool_name = tool_name_map.get(LLM_PROVIDER, "replicate_inference")
+    # Use base URL for guardrail endpoint check (strip {model} placeholder)
+    guardrail_endpoint = GENERATE_URL.split("{")[0] if "{" in GENERATE_URL else GENERATE_URL
+    payload_preview = {"max_tokens": max_tokens}
+    tool_check = gr.validate_tool_call(
+        tool_name=tool_name,
+        method="POST",
+        endpoint=guardrail_endpoint,
+        payload=payload_preview,
+    )
+    if not tool_check:
+        raise RuntimeError(f"[Guardrail] Tool call blocked: {tool_check.reason}")
+
+    # [GUARDRAIL – OPERATIONAL] Check limits before API call
+    op_check = gr.check_operational_limits(agent_name, max_tokens)
+    if not op_check:
+        raise RuntimeError(f"[Guardrail] Operational limit: {op_check.reason}")
+
+    # Estimate input tokens for evaluation
+    prompt_text = " ".join(
+        (m["content"] if isinstance(m["content"], str) else str(m["content"]))
+        for m in messages
+    )
+    estimated_input_tokens = ev.estimate_tokens(prompt_text)
+
+    # ── Dispatch to provider ────────────────────────────────────────────────
+    if LLM_PROVIDER == "watsonx":
+        response_text, input_tokens, output_tokens = _call_watsonx(
+            api_key, messages, max_tokens, temperature
+        )
+    elif LLM_PROVIDER == "replicate":
+        response_text, input_tokens, output_tokens = _call_replicate(
+            api_key, messages, max_tokens, temperature, estimated_input_tokens
+        )
+    else:
+        response_text, input_tokens, output_tokens = _call_gemini(
+            api_key, messages, max_tokens, temperature,
+            estimated_input_tokens
+        )
+
+    # Write metrics into the timer record
+    if timer is not None:
+        timer.record.input_tokens  = input_tokens
+        timer.record.output_tokens = output_tokens
+        timer.record.response_text = response_text
+        timer.record.success       = True
+
+    return response_text
+
+
+def _call_watsonx(
+    api_key: str,
+    messages: list,
+    max_tokens: int,
+    temperature: float,
+) -> tuple:
+    """Call IBM watsonx.ai. Returns (response_text, input_tokens, output_tokens)."""
     token = get_iam_token(api_key)
 
     payload = {
@@ -92,18 +225,175 @@ def call_watsonx(
         json=payload,
         timeout=120,
     )
-
     if resp.status_code != 200:
-        raise RuntimeError(
-            f"watsonx API error ({resp.status_code}): {resp.text}"
-        )
+        raise RuntimeError(f"watsonx API error ({resp.status_code}): {resp.text}")
 
     data = resp.json()
-    # Navigate the response structure
     try:
-        return data["choices"][0]["message"]["content"]
+        response_text = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError):
-        raise RuntimeError(f"Unexpected response structure: {json.dumps(data)}")
+        raise RuntimeError(f"Unexpected watsonx response: {json.dumps(data)[:300]}")
+
+    usage         = data.get("usage", {})
+    input_tokens  = usage.get("prompt_tokens",     ev.estimate_tokens(str(messages)))
+    output_tokens = usage.get("completion_tokens", ev.estimate_tokens(response_text))
+    return response_text, input_tokens, output_tokens
+
+
+def _call_gemini(
+    api_key: str,
+    messages: list,
+    max_tokens: int,
+    temperature: float,
+    estimated_input_tokens: int,
+) -> tuple:
+    """
+    Call Google Gemini generateContent REST API.
+    Returns (response_text, input_tokens, output_tokens).
+
+    Converts OpenAI-style messages → Gemini `contents` format:
+      system → first user turn with a [SYSTEM] prefix
+      user   → role "user"
+      assistant → role "model"
+    """
+    contents = []
+    system_text = ""
+
+    for msg in messages:
+        role    = msg.get("role", "user")
+        content = msg.get("content", "")
+        if role == "system":
+            system_text = content          # collected; prepended to first user turn
+        elif role == "user":
+            text = f"[SYSTEM INSTRUCTIONS]\n{system_text}\n\n{content}" if system_text else content
+            contents.append({"role": "user",  "parts": [{"text": text}]})
+            system_text = ""               # only prepend once
+        elif role in ("assistant", "model"):
+            contents.append({"role": "model", "parts": [{"text": content}]})
+
+    payload = {
+        "contents": contents,
+        "generationConfig": {
+            "maxOutputTokens": max_tokens,
+            "temperature":     temperature,
+        },
+    }
+
+    url  = f"{GENERATE_URL}?key={api_key}"
+    resp = requests.post(
+        url,
+        headers={"Content-Type": "application/json"},
+        json=payload,
+        timeout=120,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Gemini API error ({resp.status_code}): {resp.text[:400]}")
+
+    data = resp.json()
+    try:
+        response_text = data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError):
+        raise RuntimeError(f"Unexpected Gemini response: {json.dumps(data)[:300]}")
+
+    # Gemini returns usageMetadata
+    usage         = data.get("usageMetadata", {})
+    input_tokens  = usage.get("promptTokenCount",     estimated_input_tokens)
+    output_tokens = usage.get("candidatesTokenCount", ev.estimate_tokens(response_text))
+    return response_text, input_tokens, output_tokens
+
+
+def _call_replicate(
+    api_key: str,
+    messages: list,
+    max_tokens: int,
+    temperature: float,
+    estimated_input_tokens: int,
+) -> tuple:
+    """
+    Call Replicate's REST API for a language model.
+    Returns (response_text, input_tokens, output_tokens).
+
+    Replicate flow:
+      1. POST /v1/models/{owner}/{name}/predictions  → get prediction ID
+      2. Poll GET /v1/predictions/{id}               → wait for 'succeeded'
+      3. Concatenate output tokens into final string
+
+    Messages are converted to a single prompt string:
+      system prompt prepended, then user/assistant turns interleaved.
+    """
+    # Build a single text prompt from OpenAI-style messages
+    prompt_parts = []
+    for msg in messages:
+        role    = msg.get("role", "user")
+        content = msg.get("content", "")
+        if role == "system":
+            prompt_parts.append(f"<|system|>\n{content}")
+        elif role == "user":
+            prompt_parts.append(f"<|user|>\n{content}")
+        elif role in ("assistant", "model"):
+            prompt_parts.append(f"<|assistant|>\n{content}")
+    prompt_parts.append("<|assistant|>")   # signal the model to start responding
+    full_prompt = "\n".join(prompt_parts)
+
+    # Resolve the model URL: replace {model} placeholder
+    model_url = GENERATE_URL.format(model=MODEL_ID)
+
+    payload = {
+        "input": {
+            "prompt":     full_prompt,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type":  "application/json",
+        "Prefer":        "wait",        # ask Replicate to wait up to 60 s synchronously
+    }
+
+    resp = requests.post(model_url, headers=headers, json=payload, timeout=120)
+
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"Replicate API error ({resp.status_code}): {resp.text[:400]}")
+
+    data = resp.json()
+
+    # If 'Prefer: wait' was honoured, the prediction is already complete
+    status = data.get("status", "")
+    if status not in ("succeeded", "processing", "starting"):
+        # Poll until done (fallback for older API versions)
+        pred_id   = data.get("id", "")
+        poll_url  = f"https://api.replicate.com/v1/predictions/{pred_id}"
+        for _ in range(60):          # max 60 poll attempts (~120 s)
+            import time as _t; _t.sleep(2)
+            poll_resp = requests.get(poll_url, headers=headers, timeout=30)
+            if poll_resp.status_code == 200:
+                data   = poll_resp.json()
+                status = data.get("status", "")
+                if status == "succeeded":
+                    break
+                if status in ("failed", "canceled"):
+                    raise RuntimeError(f"Replicate prediction {status}: {data.get('error','unknown')}")
+
+    if data.get("status") != "succeeded":
+        raise RuntimeError(f"Replicate prediction did not complete: status={data.get('status')}, error={data.get('error','')}")
+
+    # Output is a list of string tokens – join them
+    output = data.get("output", [])
+    if isinstance(output, list):
+        response_text = "".join(str(t) for t in output)
+    else:
+        response_text = str(output)
+
+    if not response_text.strip():
+        raise RuntimeError("Replicate returned an empty response.")
+
+    # Token counts from metrics if available, else estimate
+    metrics       = data.get("metrics", {})
+    input_tokens  = int(metrics.get("input_token_count",  estimated_input_tokens))
+    output_tokens = int(metrics.get("output_token_count", ev.estimate_tokens(response_text)))
+    return response_text, input_tokens, output_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -204,14 +494,24 @@ def run_pathologist_agent(
     api_key: str,
     image_context: dict,
     symptom_description: str,
-) -> str:
+) -> tuple:
     """
     Agent 1: sends image metadata + farmer symptom description to Granite 4
-    and returns a structured diagnostic report.
+    and returns (diagnosis_text, AgentCallRecord).
+
+    Guardrails applied:
+      • Data guardrail    – PII masking on image context
+      • Operational       – token + iteration limits
+      • Output            – validate_output, check_ethical_compliance
+      • Multi-agent       – marks Pathologist as started
     """
+    # [GUARDRAIL – DATA] Protect image context before sending to agent
+    data_result = gr.protect_data(image_context, role="user")
+    safe_context = data_result.sanitised_value if data_result.sanitised_value else image_context
+
     context_block = "\n".join(
         f"- {k.replace('_', ' ').title()}: {v}"
-        for k, v in image_context.items()
+        for k, v in safe_context.items()
     )
 
     user_message = (
@@ -230,7 +530,32 @@ def run_pathologist_agent(
         {"role": "user", "content": user_message},
     ]
 
-    return call_watsonx(api_key, messages, max_tokens=1200, temperature=0.2)
+    # [EVAL] Time the API call
+    timer = ev.AgentTimer("Pathologist Agent")
+    with timer:
+        raw_response = call_llm(
+            api_key, messages, max_tokens=1200, temperature=0.2,
+            agent_name="Pathologist Agent", timer=timer,
+        )
+
+    # [GUARDRAIL – OUTPUT] Validate response from Pathologist Agent
+    out_check = gr.validate_output(raw_response, agent_name="Pathologist Agent")
+    if not out_check:
+        timer.record.success = False
+        timer.record.error_message = out_check.reason
+        raise RuntimeError(f"[Guardrail] Pathologist output blocked: {out_check.reason}")
+    response_text = out_check.sanitised_value if out_check.sanitised_value else raw_response
+
+    # [GUARDRAIL – ETHICS] Ethical and compliance check
+    ethics_check = gr.check_ethical_compliance(response_text, agent_name="Pathologist Agent")
+    if not ethics_check:
+        timer.record.success = False
+        raise RuntimeError(f"[Guardrail] Ethical check failed for Pathologist: {ethics_check.reason}")
+    # Use potentially disclaimer-enhanced text
+    final_text = ethics_check.sanitised_value if ethics_check.sanitised_value else response_text
+    timer.record.response_text = final_text
+
+    return final_text, timer.record
 
 
 # ---------------------------------------------------------------------------
@@ -270,11 +595,30 @@ OUTPUT FORMAT (use exactly these headings):
 """).strip()
 
 
-def run_extension_officer_agent(api_key: str, diagnosis_report: str) -> str:
+def run_extension_officer_agent(api_key: str, diagnosis_report: str) -> tuple:
     """
     Agent 2: receives the Pathologist's report and produces a farmer-friendly
-    advisory.
+    advisory. Returns (advisory_text, AgentCallRecord).
+
+    Guardrails applied:
+      • Multi-agent   – validate handoff from Pathologist, cross-verify input
+      • Operational   – token + iteration limits
+      • Output        – validate_output, check_ethical_compliance
     """
+    # [GUARDRAIL – MULTI-AGENT] Validate handoff: Pathologist → Extension Officer
+    handoff_check = gr.validate_agent_handoff(
+        from_agent="Pathologist Agent",
+        to_agent="Extension Officer Agent",
+        output_length=len(diagnosis_report),
+    )
+    if not handoff_check:
+        raise RuntimeError(f"[Guardrail] Agent handoff blocked: {handoff_check.reason}")
+
+    # [GUARDRAIL – MULTI-AGENT] Cross-verify the Pathologist's output before using it
+    crosscheck = gr.verify_cross_agent_output("Pathologist Agent", diagnosis_report)
+    if not crosscheck:
+        raise RuntimeError(f"[Guardrail] Cross-agent verification failed: {crosscheck.reason}")
+
     messages = [
         {
             "role": "system",
@@ -291,7 +635,31 @@ def run_extension_officer_agent(api_key: str, diagnosis_report: str) -> str:
         },
     ]
 
-    return call_watsonx(api_key, messages, max_tokens=1400, temperature=0.4)
+    # [EVAL] Time the API call
+    timer = ev.AgentTimer("Extension Officer Agent")
+    with timer:
+        raw_response = call_llm(
+            api_key, messages, max_tokens=1400, temperature=0.4,
+            agent_name="Extension Officer Agent", timer=timer,
+        )
+
+    # [GUARDRAIL – OUTPUT] Validate Extension Officer response
+    out_check = gr.validate_output(raw_response, agent_name="Extension Officer Agent")
+    if not out_check:
+        timer.record.success = False
+        timer.record.error_message = out_check.reason
+        raise RuntimeError(f"[Guardrail] Extension Officer output blocked: {out_check.reason}")
+    response_text = out_check.sanitised_value if out_check.sanitised_value else raw_response
+
+    # [GUARDRAIL – ETHICS] Ethical compliance check
+    ethics_check = gr.check_ethical_compliance(response_text, agent_name="Extension Officer Agent")
+    if not ethics_check:
+        timer.record.success = False
+        raise RuntimeError(f"[Guardrail] Ethical check failed for Extension Officer: {ethics_check.reason}")
+    final_text = ethics_check.sanitised_value if ethics_check.sanitised_value else response_text
+    timer.record.response_text = final_text
+
+    return final_text, timer.record
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +709,16 @@ def build_final_report(
 
 
 # ---------------------------------------------------------------------------
+# Helper – render guardrail badge
+# ---------------------------------------------------------------------------
+
+def _render_guardrail_badge(label: str, passed: bool) -> str:
+    colour = "#22863a" if passed else "#cb2431"
+    icon   = "✅" if passed else "❌"
+    return f'<span style="background:{colour};color:#fff;padding:2px 8px;border-radius:4px;font-size:0.75rem;margin:2px">{icon} {label}</span>'
+
+
+# ---------------------------------------------------------------------------
 # Streamlit Application
 # ---------------------------------------------------------------------------
 
@@ -352,44 +730,100 @@ def main():
         initial_sidebar_state="expanded",
     )
 
+    # API key comes entirely from .env – never shown in the UI
+    api_key = _ENV_API_KEY
+
     # ── Sidebar ──────────────────────────────────────────────────────────────
     with st.sidebar:
-        st.title("🌿 AgriDoctor")
-        st.caption("AI-Powered Crop Disease Diagnosis")
+        # Logo / title
+        st.markdown(
+            "<h2 style='margin-bottom:0'>🌿 AgriDoctor</h2>"
+            "<p style='color:#57606a;margin-top:2px;font-size:0.85rem'>"
+            "AI-Powered Crop Disease Diagnosis</p>",
+            unsafe_allow_html=True,
+        )
         st.divider()
 
-        st.subheader("🔑 API Configuration")
-        api_key = st.text_input(
-            "IBM Cloud API Key",
-            type="password",
-            placeholder="Enter your IBM Cloud API key",
-            help="Your IBM Cloud API key is used to authenticate with watsonx.ai. "
-                 "It is never stored or logged.",
+        # System status card
+        api_ready = bool(api_key and api_key.strip())
+        status_colour = "#22863a" if api_ready else "#cb2431"
+        status_icon   = "🟢" if api_ready else "🔴"
+        status_text   = "Connected" if api_ready else "No API key found"
+        provider_endpoint = WATSONX_ENDPOINT if LLM_PROVIDER == "watsonx" else "generativelanguage.googleapis.com"
+        project_line = (
+            f"<span style='color:#57606a'>🗂️ Project …{PROJECT_ID[-6:]}</span><br>"
+            if PROJECT_ID else ""
+        )
+        st.markdown(
+            f"<div style='background:#f7f8fa;border:1px solid #e5e7eb;"
+            f"border-radius:8px;padding:10px 14px;font-size:0.83rem'>"
+            f"<b>System Status</b><br>"
+            f"<span style='color:{status_colour}'>{status_icon} {status_text}</span><br>"
+            f"<span style='color:#57606a'>🤖 {PROVIDER_LABEL}</span><br>"
+            f"{project_line}"
+            f"<span style='color:#57606a'>🌐 {provider_endpoint}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
         )
 
         st.divider()
-        st.subheader("ℹ️ About")
+
+        # How it works
+        st.subheader("ℹ️ How It Works")
         st.markdown(
             """
-            **AgriDoctor** uses a two-agent AI workflow:
-
-            **🔬 Agent 1 – Pathologist**
-            Analyses crop/leaf images to detect diseases and symptoms.
-
-            **📋 Agent 2 – Extension Officer**
-            Converts the diagnosis into practical farmer-friendly advice.
-
-            **Powered by:**
-            IBM Granite 4 H Small on IBM watsonx.ai
+**① Upload** a crop / leaf photo
+**② Guardrails** validate your input
+**③ 🔬 Pathologist Agent** diagnoses the disease
+**④ Multi-agent handoff** verified by guardrails
+**⑤ 📋 Extension Officer** writes farmer-friendly advice
+**⑥ Output guardrails** applied
+**⑦ Download** your advisory report
             """
         )
+
+        st.divider()
+
+        # About the agents
+        st.subheader("🤖 Agents")
+        st.markdown(
+            f"""
+**🔬 Agent 1 – Pathologist**
+Analyses image colour data and reported symptoms to identify crop diseases.
+
+**📋 Agent 2 – Extension Officer**
+Converts the technical diagnosis into plain-language advice any farmer can act on.
+
+*Powered by {PROVIDER_LABEL}*
+            """
+        )
+
+        st.divider()
+
+        # Guardrail Status Panel
+        st.subheader("🛡️ Guardrail Status")
+        st.caption("Live results appear here after each diagnosis run.")
+        audit_placeholder = st.empty()
+
         st.divider()
         st.caption(
             "⚠️ AI-generated preliminary assessment only. "
-            "Consult a certified expert for confirmation."
+            "Consult a certified expert before applying any treatment."
         )
 
-    # ── Main Page ─────────────────────────────────────────────────────────────
+    # ── Main Page with Tab Navigation ─────────────────────────────────────────
+    # Dashboard is the first tab so it is visible immediately on load
+    dash_tab, main_tab = st.tabs(["📊 Performance Dashboard", "🌾 Diagnose Crop"])
+
+    with dash_tab:
+        db.render_dashboard(st.session_state.get("latest_metrics", None))
+
+    with main_tab:
+        _render_diagnose_tab(api_key, audit_placeholder)
+
+
+def _render_diagnose_tab(api_key: str, audit_placeholder) -> None:
+    """Render the main crop diagnosis tab content."""
     st.title("🌾 AgriDoctor – Crop Disease Diagnosis & Advisory")
     st.markdown(
         "Upload a photo of your crop or plant leaf. AgriDoctor's two AI agents "
@@ -398,9 +832,11 @@ def main():
 
     st.info(
         "📌 **How it works:** "
-        "① Upload image → ② Pathologist Agent diagnoses the disease → "
-        "③ Extension Officer Agent generates farmer-friendly advice → "
-        "④ Download your advisory report.",
+        "① Upload image → ② Guardrails validate input → "
+        "③ Pathologist Agent diagnoses the disease → "
+        "④ Multi-agent guardrails verified → "
+        "⑤ Extension Officer Agent generates farmer-friendly advice → "
+        "⑥ Output guardrails applied → ⑦ Download your advisory report.",
         icon="ℹ️",
     )
 
@@ -453,12 +889,63 @@ def main():
 
     # ── Run Agents ────────────────────────────────────────────────────────────
     if diagnose_btn:
-        if not api_key:
-            st.error(
-                "🔐 API key is required. Please enter your IBM Cloud API key "
-                "in the sidebar."
-            )
-            st.stop()
+
+        # ── Reset all state for fresh run ────────────────────────────────────
+        gr.clear_audit_log()
+        gr.reset_operational_counters()
+        gr.reset_multi_agent_state()
+        session_start = time.time()
+        agent_records = []
+        handoff_ok = True
+
+        # ════════════════════════════════════════════════════════════════════
+        # STAGE 0 – Pre-flight Guardrail Checks
+        # ════════════════════════════════════════════════════════════════════
+        with st.status("🛡️ Running input guardrails…", expanded=False) as status_box:
+
+            # [GUARDRAIL – INPUT] API key format
+            if not api_key:
+                st.error(
+                    "🔐 API key is not configured. Please add `WATSONX_API_KEY` "
+                    "to your `.env` file and restart the application."
+                )
+                st.stop()
+
+            key_check = gr.validate_api_key_format(api_key)
+            if not key_check:
+                st.error(f"🔐 {key_check.reason}")
+                st.stop()
+            st.write("✅ API key format validated")
+
+            # [GUARDRAIL – INPUT] Image file validation
+            img_check = gr.validate_image_file(uploaded_file)
+            if not img_check:
+                st.error(f"📷 Image validation failed: {img_check.reason}")
+                st.stop()
+            st.write("✅ Image file validated (format, size, magic bytes)")
+
+            # [GUARDRAIL – SECURITY] Jailbreak + SQL injection on symptom text
+            jb_check = gr.check_jailbreak(symptom_description)
+            if not jb_check:
+                st.error(f"🚫 Security check failed: {jb_check.reason}")
+                st.stop()
+            st.write("✅ Jailbreak detection passed")
+
+            sql_check = gr.check_sql_injection(symptom_description)
+            if not sql_check:
+                st.error(f"🚫 SQL injection detected: {sql_check.reason}")
+                st.stop()
+            st.write("✅ SQL injection check passed")
+
+            # [GUARDRAIL – INPUT] Symptom text validation
+            input_check = gr.validate_input(symptom_description)
+            if not input_check:
+                st.error(f"⚠️ Input validation failed: {input_check.reason}")
+                st.stop()
+            safe_symptoms = input_check.sanitised_value or symptom_description
+            st.write("✅ Input validated (injection, PII, content, relevance)")
+
+            status_box.update(label="🛡️ All input guardrails passed", state="complete")
 
         # Extract image metadata using PIL
         try:
@@ -467,16 +954,20 @@ def main():
             st.error(f"Failed to process the uploaded image: {exc}")
             st.stop()
 
-        # ── Agent 1: Pathologist ──────────────────────────────────────────────
+        # ════════════════════════════════════════════════════════════════════
+        # STAGE 1 – Agent 1: Pathologist
+        # ════════════════════════════════════════════════════════════════════
         st.subheader("🔬 Agent 1 – Pathologist Agent")
         st.caption("Analysing your crop image for disease symptoms…")
 
         diagnosis_result = None
+        path_record = None
         with st.spinner("🧬 Pathologist Agent is examining the image…"):
             try:
-                diagnosis_result = run_pathologist_agent(
-                    api_key, image_context, symptom_description
+                diagnosis_result, path_record = run_pathologist_agent(
+                    api_key, image_context, safe_symptoms
                 )
+                agent_records.append(path_record)
             except RuntimeError as exc:
                 error_msg = str(exc)
                 if "401" in error_msg or "403" in error_msg:
@@ -484,6 +975,8 @@ def main():
                         "❌ Authentication failed. Please check your IBM Cloud "
                         "API key and try again."
                     )
+                elif "[Guardrail]" in error_msg:
+                    st.error(f"🛡️ Guardrail blocked the Pathologist Agent: {error_msg}")
                 elif "model" in error_msg.lower():
                     st.error(
                         "❌ The selected model is not available or not supported "
@@ -499,18 +992,73 @@ def main():
         with st.expander("📄 Pathologist Agent Report", expanded=True):
             st.markdown(diagnosis_result)
 
-        # ── Agent 2: Extension Officer ────────────────────────────────────────
+        # ════════════════════════════════════════════════════════════════════
+        # STAGE 2 – Human-in-the-Loop Review (if required)
+        # ════════════════════════════════════════════════════════════════════
+        approval_request = gr.assess_human_review_need(diagnosis_result)
+
+        if approval_request.requires_approval:
+            st.divider()
+            st.subheader("👤 Human-in-the-Loop Review Required")
+            st.warning(
+                f"⚠️ **{approval_request.risk_level.upper()} RISK** – {approval_request.description}\n\n"
+                "A human review is recommended before the farmer acts on this report. "
+                "Please confirm you have reviewed the Pathologist's diagnosis above.",
+                icon="⚠️",
+            )
+
+            col_approve, col_reject = st.columns(2)
+            with col_approve:
+                human_approved = st.button(
+                    "✅ Reviewed & Approved – Continue",
+                    type="primary",
+                    use_container_width=True,
+                    key="human_approve",
+                )
+            with col_reject:
+                human_rejected = st.button(
+                    "❌ Reject – Stop Pipeline",
+                    use_container_width=True,
+                    key="human_reject",
+                )
+
+            if human_rejected:
+                gr.record_human_decision(approval_request, approved=False)
+                st.error(
+                    "🛑 Pipeline stopped by human reviewer. "
+                    "Please consult a certified plant pathologist directly."
+                )
+                st.stop()
+
+            if not human_approved:
+                st.info(
+                    "👆 Please click **Reviewed & Approved** above to proceed to "
+                    "the Extension Officer advisory, or click **Reject** to stop."
+                )
+                st.stop()
+
+            gr.record_human_decision(approval_request, approved=True)
+            st.success("✅ Human review completed. Proceeding to Extension Officer Agent.")
+        else:
+            # Low / medium risk – record automatic pass
+            gr.record_human_decision(approval_request, approved=True)
+
+        # ════════════════════════════════════════════════════════════════════
+        # STAGE 3 – Agent 2: Extension Officer
+        # ════════════════════════════════════════════════════════════════════
         st.subheader("📋 Agent 2 – Extension Officer Agent")
         st.caption(
             "Converting the diagnosis into a farmer-friendly advisory…"
         )
 
         advisory_result = None
+        ext_record = None
         with st.spinner("📝 Extension Officer Agent is preparing your advisory…"):
             try:
-                advisory_result = run_extension_officer_agent(
+                advisory_result, ext_record = run_extension_officer_agent(
                     api_key, diagnosis_result
                 )
+                agent_records.append(ext_record)
             except RuntimeError as exc:
                 error_msg = str(exc)
                 if "401" in error_msg or "403" in error_msg:
@@ -518,6 +1066,9 @@ def main():
                         "❌ Authentication failed. Please check your IBM Cloud "
                         "API key and try again."
                     )
+                elif "[Guardrail]" in error_msg:
+                    st.error(f"🛡️ Guardrail blocked the Extension Officer Agent: {error_msg}")
+                    handoff_ok = False
                 else:
                     st.error(f"❌ Extension Officer Agent error: {error_msg}")
                 st.stop()
@@ -528,7 +1079,30 @@ def main():
         with st.expander("📄 Extension Officer Advisory", expanded=True):
             st.markdown(advisory_result)
 
-        # ── Combined Final Report ─────────────────────────────────────────────
+        # ════════════════════════════════════════════════════════════════════
+        # STAGE 4 – Evaluate Session & Store Metrics
+        # ════════════════════════════════════════════════════════════════════
+        session_end = time.time()
+        guardrail_audit = gr.get_audit_log()
+
+        session_metrics = ev.evaluate_session(
+            agent_records        = agent_records,
+            pathologist_output   = diagnosis_result or "",
+            extension_output     = advisory_result or "",
+            image_context        = image_context,
+            symptom_description  = safe_symptoms,
+            guardrail_audit_log  = guardrail_audit,
+            session_start        = session_start,
+            session_end          = session_end,
+            handoff_successful   = handoff_ok,
+            loop_detected        = False,
+            image_filename       = uploaded_file.name,
+        )
+        st.session_state["latest_metrics"] = session_metrics
+
+        # ════════════════════════════════════════════════════════════════════
+        # STAGE 5 – Combined Final Report
+        # ════════════════════════════════════════════════════════════════════
         st.divider()
         st.subheader("📑 Combined Final Report")
 
@@ -538,7 +1112,7 @@ def main():
             uploaded_file.name,
         )
 
-        st.success("✅ Multi-agent analysis complete!")
+        st.success("✅ Multi-agent analysis complete! View the **📊 Performance Dashboard** tab for full evaluation metrics.")
 
         with st.expander("📋 View Full Combined Report", expanded=False):
             st.text(final_report)
@@ -551,6 +1125,63 @@ def main():
             mime="text/plain",
             use_container_width=True,
         )
+
+        # ════════════════════════════════════════════════════════════════════
+        # STAGE 6 – Compliance Report (Sidebar + Expander)
+        # ════════════════════════════════════════════════════════════════════
+        compliance = gr.get_compliance_report()
+        cat_summary = compliance.get("by_category", {})
+
+        # Sidebar audit badge update
+        badge_html = ""
+        category_icons = {
+            "INPUT":       "📥",
+            "OUTPUT":      "📤",
+            "TOOL":        "🔧",
+            "DATA":        "💾",
+            "SECURITY":    "🔒",
+            "OPERATIONAL": "⚙️",
+            "HUMAN_LOOP":  "👤",
+            "MULTI_AGENT": "🤝",
+            "ETHICS":      "⚖️",
+        }
+        for cat, stats in cat_summary.items():
+            icon  = category_icons.get(cat, "🛡️")
+            label = f"{icon} {cat}"
+            all_passed = stats["failed"] == 0
+            badge_html += _render_guardrail_badge(label, all_passed) + " "
+
+        with audit_placeholder:
+            st.markdown(badge_html, unsafe_allow_html=True)
+            st.caption(
+                f"**{compliance['overall_passed']}** checks passed · "
+                f"**{compliance['overall_failed']}** checks flagged"
+            )
+
+        # Detailed compliance expander in main area
+        st.divider()
+        with st.expander("🛡️ Guardrail Compliance Report", expanded=False):
+            st.subheader("Guardrail Compliance Summary")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Total Checks", compliance["total_checks"])
+            col2.metric("Passed", compliance["overall_passed"])
+            col3.metric(
+                "Flagged",
+                compliance["overall_failed"],
+                delta=None if compliance["overall_failed"] == 0 else f"-{compliance['overall_failed']}",
+                delta_color="inverse",
+            )
+
+            st.markdown("#### Results by Category")
+            for cat, stats in cat_summary.items():
+                icon = category_icons.get(cat, "🛡️")
+                status = "✅ All Passed" if stats["failed"] == 0 else f"⚠️ {stats['failed']} Flagged"
+                st.markdown(
+                    f"**{icon} {cat}** – {stats['total']} checks · {status}"
+                )
+
+            st.markdown("#### Full Audit Trail")
+            st.json(compliance["audit_log"])
 
         # ── Footer Warning ────────────────────────────────────────────────────
         st.divider()
