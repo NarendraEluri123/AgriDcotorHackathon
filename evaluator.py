@@ -38,7 +38,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
-# Cost constants (watsonx.ai Granite 4 – illustrative USD per 1 K tokens)
+# Cost constants (Replicate – illustrative USD per 1 K tokens)
 # ---------------------------------------------------------------------------
 COST_PER_1K_INPUT_TOKENS  = 0.00035   # $ per 1,000 input tokens
 COST_PER_1K_OUTPUT_TOKENS = 0.00105   # $ per 1,000 output tokens

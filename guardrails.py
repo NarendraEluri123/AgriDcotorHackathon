@@ -206,15 +206,15 @@ def validate_input(symptom_text: str) -> GuardrailResult:
 
 
 def validate_api_key_format(api_key: str) -> GuardrailResult:
-    """Basic format check on the IBM Cloud API key."""
+    """Basic format check on the Replicate API key."""
     if not api_key or not api_key.strip():
         _audit("INPUT", "api_key_format", False, "empty")
         return GuardrailResult(False, "API key cannot be empty.")
     key = api_key.strip()
-    # IBM Cloud API keys are typically ~44 alphanumeric+special chars
+    # Replicate API keys are typically ~40 chars starting with "r8_"
     if len(key) < 20:
         _audit("INPUT", "api_key_format", False, f"len={len(key)}")
-        return GuardrailResult(False, "API key appears too short. Please verify your IBM Cloud API key.")
+        return GuardrailResult(False, "API key appears too short. Please verify your Replicate API key.")
     if not re.match(r'^[\w\-]+$', key):
         _audit("INPUT", "api_key_format", False, "invalid chars")
         return GuardrailResult(False, "API key contains unexpected characters.")
@@ -379,31 +379,11 @@ def validate_output(response_text: str, agent_name: str = "agent") -> GuardrailR
 
 # Whitelist of allowed endpoints
 _ALLOWED_ENDPOINTS: List[str] = [
-    "https://us-south.ml.cloud.ibm.com",
-    "https://iam.cloud.ibm.com",
-    "https://generativelanguage.googleapis.com",
     "https://api.replicate.com",
 ]
 
 # Allowed HTTP methods per tool
 _TOOL_PERMISSIONS: Dict[str, Dict[str, Any]] = {
-    "watsonx_inference": {
-        "allowed_methods": ["POST"],
-        "allowed_endpoints": _ALLOWED_ENDPOINTS,
-        "max_tokens_per_call": 2000,
-        "requires_auth": True,
-    },
-    "iam_token": {
-        "allowed_methods": ["POST"],
-        "allowed_endpoints": ["https://iam.cloud.ibm.com"],
-        "requires_auth": False,
-    },
-    "gemini_inference": {
-        "allowed_methods": ["POST"],
-        "allowed_endpoints": ["https://generativelanguage.googleapis.com"],
-        "max_tokens_per_call": 8192,
-        "requires_auth": True,
-    },
     "replicate_inference": {
         "allowed_methods": ["POST"],
         "allowed_endpoints": ["https://api.replicate.com"],

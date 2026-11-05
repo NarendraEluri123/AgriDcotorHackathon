@@ -6,15 +6,14 @@ Two-agent workflow:
   2. Extension Officer Agent – converts the diagnosis into a farmer-friendly
      remedial-action report.
 
-Both agents call the IBM watsonx.ai REST API with the IBM Granite 4 H Small
-model.  The Pathologist Agent sends the image as a base-64 encoded data URL
-alongside the prompt; the Extension Officer Agent sends plain text.
+Both agents call the Replicate REST API with the IBM Granite Vision 4.1 4B
+model (ibm-granite/granite-vision-4.1-4b).
 
 Guardrails are applied at every stage of the pipeline:
   • Input  → validate_input, validate_image_file, validate_api_key_format,
              check_jailbreak, check_sql_injection
   • Data   → protect_data (PII masking on image metadata)
-  • Tool   → validate_tool_call (before every watsonx API call)
+  • Tool   → validate_tool_call (before every Replicate API call)
   • Oper.  → check_operational_limits (token budget, rate limit, iterations)
   • Output → validate_output, check_ethical_compliance (per-agent response)
   • Multi  → validate_agent_handoff, verify_cross_agent_output
@@ -47,77 +46,17 @@ _ENV_PATH = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=_ENV_PATH, override=True)
 
 # ---------------------------------------------------------------------------
-# Configuration – auto-detect active LLM provider from .env
-# Priority: Replicate → watsonx → Gemini  (first un-commented key wins)
+# Configuration – Replicate + IBM Granite Vision 4.1 4B
 # ---------------------------------------------------------------------------
-_REPLICATE_API_KEY = os.getenv("REPLICATE_API_KEY", "").strip()
-_WATSONX_API_KEY   = os.getenv("WATSONX_API_KEY",   "").strip()
-_GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY",     "").strip()
-
-WATSONX_ENDPOINT = ""
-PROJECT_ID       = ""
-IAM_TOKEN_URL    = ""
-
-if _REPLICATE_API_KEY:
-    LLM_PROVIDER   = "replicate"
-    _ENV_API_KEY   = _REPLICATE_API_KEY
-    MODEL_ID       = os.getenv("REPLICATE_MODEL_ID", "ibm-granite/granite-3.3-8b-instruct")
-    # Replicate Predictions API v1
-    GENERATE_URL   = "https://api.replicate.com/v1/models/{model}/predictions"
-    PROVIDER_LABEL = f"Replicate · {MODEL_ID}"
-elif _WATSONX_API_KEY:
-    LLM_PROVIDER     = "watsonx"
-    _ENV_API_KEY     = _WATSONX_API_KEY
-    MODEL_ID         = os.getenv("WATSONX_MODEL_ID",  "ibm/granite-4-h-small")
-    WATSONX_ENDPOINT = os.getenv("WATSONX_URL", "https://us-south.ml.cloud.ibm.com").rstrip("/")
-    PROJECT_ID       = os.getenv("WATSONX_PROJECT_ID","5247ecfe-b435-4f50-93e9-2ed52faedf1d")
-    IAM_TOKEN_URL    = "https://iam.cloud.ibm.com/identity/token"
-    GENERATE_URL     = f"{WATSONX_ENDPOINT}/ml/v1/text/chat?version=2024-05-31"
-    PROVIDER_LABEL   = f"IBM watsonx.ai · {MODEL_ID}"
-else:
-    LLM_PROVIDER   = "gemini"
-    _ENV_API_KEY   = _GEMINI_API_KEY
-    MODEL_ID       = os.getenv("GEMINI_MODEL_ID", "gemini-2.5-flash")
-    GENERATE_URL   = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{MODEL_ID}:generateContent"
-    )
-    PROVIDER_LABEL = f"Google Gemini · {MODEL_ID}"
+_ENV_API_KEY   = os.getenv("REPLICATE_API_KEY", "").strip()
+MODEL_ID       = os.getenv("REPLICATE_MODEL_ID", "ibm-granite/granite-vision-4.1-4b")
+LLM_PROVIDER   = "replicate"
+GENERATE_URL   = "https://api.replicate.com/v1/models/{model}/predictions"
+PROVIDER_LABEL = f"IBM Granite · {MODEL_ID} via Replicate"
 
 
 # ---------------------------------------------------------------------------
-# IBM IAM Token Helper  (watsonx only)
-# ---------------------------------------------------------------------------
-
-@st.cache_data(ttl=3000, show_spinner=False)
-def get_iam_token(api_key: str) -> str:
-    """Exchange an IBM Cloud API key for a short-lived IAM bearer token."""
-    tool_check = gr.validate_tool_call(
-        tool_name="iam_token",
-        method="POST",
-        endpoint=IAM_TOKEN_URL,
-    )
-    if not tool_check:
-        raise RuntimeError(f"[Guardrail] IAM token call blocked: {tool_check.reason}")
-
-    resp = requests.post(
-        IAM_TOKEN_URL,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        data={
-            "grant_type": "urn:ibm:params:oauth:grant-type:apikey",
-            "apikey": api_key,
-        },
-        timeout=30,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"IAM token request failed ({resp.status_code}): {resp.text}"
-        )
-    return resp.json()["access_token"]
-
-
-# ---------------------------------------------------------------------------
-# Core API call  (provider-agnostic)
+# Core API call  (Replicate only)
 # ---------------------------------------------------------------------------
 
 def call_llm(
@@ -129,12 +68,8 @@ def call_llm(
     timer: "ev.AgentTimer | None" = None,
 ) -> str:
     """
-    Send a chat-completion request to the active LLM provider and return
-    the assistant response text.
-
-    Supports:
-      • IBM watsonx.ai  (WATSONX_API_KEY set in .env)
-      • Google Gemini   (GEMINI_API_KEY set in .env, watsonx commented out)
+    Send a chat-completion request to Replicate (IBM Granite Vision 4.1 4B)
+    and return the assistant response text.
 
     `messages` follows the OpenAI-style format:
         [{"role": "user"|"system", "content": "..."}, ...]
@@ -143,20 +78,12 @@ def call_llm(
     Evaluation:  Token counts written to timer.record when provided.
     """
     # [GUARDRAIL – TOOL] Validate tool call
-    tool_name_map = {
-        "watsonx":   "watsonx_inference",
-        "gemini":    "gemini_inference",
-        "replicate": "replicate_inference",
-    }
-    tool_name = tool_name_map.get(LLM_PROVIDER, "replicate_inference")
-    # Use base URL for guardrail endpoint check (strip {model} placeholder)
-    guardrail_endpoint = GENERATE_URL.split("{")[0] if "{" in GENERATE_URL else GENERATE_URL
-    payload_preview = {"max_tokens": max_tokens}
+    guardrail_endpoint = GENERATE_URL.split("{")[0]
     tool_check = gr.validate_tool_call(
-        tool_name=tool_name,
+        tool_name="replicate_inference",
         method="POST",
         endpoint=guardrail_endpoint,
-        payload=payload_preview,
+        payload={"max_tokens": max_tokens},
     )
     if not tool_check:
         raise RuntimeError(f"[Guardrail] Tool call blocked: {tool_check.reason}")
@@ -173,20 +100,9 @@ def call_llm(
     )
     estimated_input_tokens = ev.estimate_tokens(prompt_text)
 
-    # ── Dispatch to provider ────────────────────────────────────────────────
-    if LLM_PROVIDER == "watsonx":
-        response_text, input_tokens, output_tokens = _call_watsonx(
-            api_key, messages, max_tokens, temperature
-        )
-    elif LLM_PROVIDER == "replicate":
-        response_text, input_tokens, output_tokens = _call_replicate(
-            api_key, messages, max_tokens, temperature, estimated_input_tokens
-        )
-    else:
-        response_text, input_tokens, output_tokens = _call_gemini(
-            api_key, messages, max_tokens, temperature,
-            estimated_input_tokens
-        )
+    response_text, input_tokens, output_tokens = _call_replicate(
+        api_key, messages, max_tokens, temperature, estimated_input_tokens
+    )
 
     # Write metrics into the timer record
     if timer is not None:
@@ -196,110 +112,6 @@ def call_llm(
         timer.record.success       = True
 
     return response_text
-
-
-def _call_watsonx(
-    api_key: str,
-    messages: list,
-    max_tokens: int,
-    temperature: float,
-) -> tuple:
-    """Call IBM watsonx.ai. Returns (response_text, input_tokens, output_tokens)."""
-    token = get_iam_token(api_key)
-
-    payload = {
-        "model_id": MODEL_ID,
-        "project_id": PROJECT_ID,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
-
-    resp = requests.post(
-        GENERATE_URL,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        json=payload,
-        timeout=120,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"watsonx API error ({resp.status_code}): {resp.text}")
-
-    data = resp.json()
-    try:
-        response_text = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError):
-        raise RuntimeError(f"Unexpected watsonx response: {json.dumps(data)[:300]}")
-
-    usage         = data.get("usage", {})
-    input_tokens  = usage.get("prompt_tokens",     ev.estimate_tokens(str(messages)))
-    output_tokens = usage.get("completion_tokens", ev.estimate_tokens(response_text))
-    return response_text, input_tokens, output_tokens
-
-
-def _call_gemini(
-    api_key: str,
-    messages: list,
-    max_tokens: int,
-    temperature: float,
-    estimated_input_tokens: int,
-) -> tuple:
-    """
-    Call Google Gemini generateContent REST API.
-    Returns (response_text, input_tokens, output_tokens).
-
-    Converts OpenAI-style messages → Gemini `contents` format:
-      system → first user turn with a [SYSTEM] prefix
-      user   → role "user"
-      assistant → role "model"
-    """
-    contents = []
-    system_text = ""
-
-    for msg in messages:
-        role    = msg.get("role", "user")
-        content = msg.get("content", "")
-        if role == "system":
-            system_text = content          # collected; prepended to first user turn
-        elif role == "user":
-            text = f"[SYSTEM INSTRUCTIONS]\n{system_text}\n\n{content}" if system_text else content
-            contents.append({"role": "user",  "parts": [{"text": text}]})
-            system_text = ""               # only prepend once
-        elif role in ("assistant", "model"):
-            contents.append({"role": "model", "parts": [{"text": content}]})
-
-    payload = {
-        "contents": contents,
-        "generationConfig": {
-            "maxOutputTokens": max_tokens,
-            "temperature":     temperature,
-        },
-    }
-
-    url  = f"{GENERATE_URL}?key={api_key}"
-    resp = requests.post(
-        url,
-        headers={"Content-Type": "application/json"},
-        json=payload,
-        timeout=120,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"Gemini API error ({resp.status_code}): {resp.text[:400]}")
-
-    data = resp.json()
-    try:
-        response_text = data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError):
-        raise RuntimeError(f"Unexpected Gemini response: {json.dumps(data)[:300]}")
-
-    # Gemini returns usageMetadata
-    usage         = data.get("usageMetadata", {})
-    input_tokens  = usage.get("promptTokenCount",     estimated_input_tokens)
-    output_tokens = usage.get("candidatesTokenCount", ev.estimate_tokens(response_text))
-    return response_text, input_tokens, output_tokens
 
 
 def _call_replicate(
@@ -695,7 +507,7 @@ def build_final_report(
         IMPORTANT NOTICE
         {divider}
         This report is an AI-generated preliminary assessment produced by the
-        AgriDoctor application using IBM Granite 4 H Small on IBM watsonx.ai.
+        AgriDoctor application using IBM Granite Vision 4.1 4B via Replicate.
         It is NOT a confirmed laboratory diagnosis. Farmers are strongly advised
         to consult a certified plant pathologist or local agricultural extension
         officer for confirmation, especially before applying chemical treatments.
@@ -749,19 +561,13 @@ def main():
         status_colour = "#22863a" if api_ready else "#cb2431"
         status_icon   = "🟢" if api_ready else "🔴"
         status_text   = "Connected" if api_ready else "No API key found"
-        provider_endpoint = WATSONX_ENDPOINT if LLM_PROVIDER == "watsonx" else "generativelanguage.googleapis.com"
-        project_line = (
-            f"<span style='color:#57606a'>🗂️ Project …{PROJECT_ID[-6:]}</span><br>"
-            if PROJECT_ID else ""
-        )
         st.markdown(
             f"<div style='background:#f7f8fa;border:1px solid #e5e7eb;"
             f"border-radius:8px;padding:10px 14px;font-size:0.83rem'>"
             f"<b>System Status</b><br>"
             f"<span style='color:{status_colour}'>{status_icon} {status_text}</span><br>"
             f"<span style='color:#57606a'>🤖 {PROVIDER_LABEL}</span><br>"
-            f"{project_line}"
-            f"<span style='color:#57606a'>🌐 {provider_endpoint}</span>"
+            f"<span style='color:#57606a'>🌐 api.replicate.com</span>"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -906,7 +712,7 @@ def _render_diagnose_tab(api_key: str, audit_placeholder) -> None:
             # [GUARDRAIL – INPUT] API key format
             if not api_key:
                 st.error(
-                    "🔐 API key is not configured. Please add `WATSONX_API_KEY` "
+                    "🔐 API key is not configured. Please add `REPLICATE_API_KEY` "
                     "to your `.env` file and restart the application."
                 )
                 st.stop()
